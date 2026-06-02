@@ -22,6 +22,8 @@ find_package(sensor_msgs REQUIRED)
 find_package(laser_geometry REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
@@ -36,6 +38,8 @@ set(dependencies
   laser_geometry
   tf2
   tf2_ros
+  tf2_geometry_msgs
+  rcl_interfaces
   pcl_ros
   Eigen3
   PCL
