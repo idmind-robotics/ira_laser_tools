@@ -107,6 +107,26 @@ install(DIRECTORY launch/ config/
   DESTINATION share/${PROJECT_NAME}/launch
 )
 
+#############
+## Testing ##
+#############
+
+if(BUILD_TESTING)
+  # ament_lint_auto (cpplint/uncrustify) is intentionally not enabled here: this package
+  # keeps its legacy tab-indented style rather than reformatting to the ROS 2 style guide.
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_scan_projection test/test_scan_projection.cpp)
+  target_include_directories(test_scan_projection PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${EIGEN_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_scan_projection ira_laser_tools_components)
+  ament_target_dependencies(test_scan_projection sensor_msgs Eigen3)
+
+  find_package(launch_testing_ament_cmake REQUIRED)
+  add_launch_test(test/test_composition.py)
+endif()
+
 ament_export_include_directories(include)
 ament_export_libraries(ira_laser_tools_components)
 ament_export_dependencies(${dependencies})
