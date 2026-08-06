@@ -251,13 +251,16 @@ void LaserscanMerger::scanCallback(sensor_msgs::msg::LaserScan::SharedPtr scan, 
 
 		pointcloud_to_laserscan(points, &merged_cloud);
 
-		// Publish point cloud after publishing laser scan as for some reason moveFromPCL is causing getPointCloudAsEigen to
-		// throw a segmentation fault crash
-		auto cloud_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+		if (point_cloud_publisher_->get_subscription_count() > 0)
+		{
+			// Publish point cloud after publishing laser scan as for some reason moveFromPCL is causing getPointCloudAsEigen to
+			// throw a segmentation fault crash
+			auto cloud_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
 
-		pcl_conversions::moveFromPCL(merged_cloud, *cloud_msg);
+			pcl_conversions::moveFromPCL(merged_cloud, *cloud_msg);
 
-		point_cloud_publisher_->publish(std::move(cloud_msg));
+			point_cloud_publisher_->publish(std::move(cloud_msg));
+		}
 	}
 }
 
