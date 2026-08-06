@@ -1,18 +1,16 @@
-#include <string.h>
-#include <vector>
-#include <Eigen/Dense>
+#include "ira_laser_tools/laserscan_virtualizer.hpp"
+
+#include <algorithm>
+#include <iterator>
+#include <sstream>
+
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_ros/buffer.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
-#include <laser_geometry/laser_geometry.hpp>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
-#include <pcl/io/pcd_io.h>
-#include "rclcpp/rclcpp.hpp"
 #include <pcl_conversions/pcl_conversions.h>
-#include "rcl_interfaces/msg/set_parameters_result.hpp"
-#include "sensor_msgs/msg/laser_scan.hpp"
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+
+#include "ira_laser_tools/scan_projection.hpp"
 #include "pcl_ros/transforms.hpp"
 
 typedef pcl::PointCloud<pcl::PointXYZ> myPointCloud;
@@ -22,40 +20,52 @@ using namespace pcl;
 
 using std::placeholders::_1;
 
-class LaserscanVirtualizer : public rclcpp::Node
+namespace ira_laser_tools
 {
-public:
-	LaserscanVirtualizer();
-	void pointcloud_to_laserscan(Eigen::MatrixXf points, pcl::PCLHeader scan_header, int pub_index);
-	void pointCloudCallback(sensor_msgs::msg::PointCloud2::SharedPtr pcl_in);
-	rcl_interfaces::msg::SetParametersResult reconfigureCallback(const std::vector<rclcpp::Parameter> &parameters);
 
-private:
-	std::shared_ptr<tf2_ros::TransformListener> tfListener_;
-	std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-	std::vector<tf2::Stamped<tf2::Transform>> transform_;
-	OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
+LaserscanVirtualizer::LaserscanVirtualizer(const rclcpp::NodeOptions & options)
+: Node("laserscan_virtualizer", options)
+{
+	this->declare_parameter<std::string>("base_frame", "base_link");
+	this->declare_parameter<std::string>("cloud_topic", "/cloud_pcd");
+	this->declare_parameter<std::string>("output_laser_topic", "/scan");
+	this->declare_parameter<std::string>("virtual_laser_scan", "scansx scandx");
+	this->declare_parameter("angle_min", -3.14);
+	this->declare_parameter("angle_max", 3.14);
+	this->declare_parameter("angle_increment", 0.0058);
+	this->declare_parameter("scan_time", 0.0);
+	this->declare_parameter("range_min", 0.0);
+	this->declare_parameter("range_max", 25.0);
 
-	rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_subscription_;
-	std::vector<rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr> virtual_scan_publishers;
-	std::vector<string> output_frames;
+	this->get_parameter("base_frame", base_frame);
+	this->get_parameter("cloud_topic", cloud_topic);
+	this->get_parameter("output_laser_topic", output_laser_topic);
+	this->get_parameter("virtual_laser_scan", virtual_laser_scan);
+	this->get_parameter("angle_min", angle_min);
+	this->get_parameter("angle_max", angle_max);
+	this->get_parameter("angle_increment", angle_increment);
+	this->get_parameter("scan_time", scan_time);
+	this->get_parameter("range_min", range_min);
+	this->get_parameter("range_max", range_max);
 
-	void virtual_laser_scan_parser();
+	param_callback_handle_ = this->add_on_set_parameters_callback(
+			std::bind(&LaserscanVirtualizer::reconfigureCallback, this, _1));
 
-	double angle_min;
-	double angle_max;
-	double angle_increment;
-	double time_increment;
-	double scan_time;
-	double range_min;
-	double range_max;
+	tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+	tfListener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
-	string cloud_frame;
-	string base_frame;
-	string cloud_topic;
-	string output_laser_topic;
-	string virtual_laser_scan;
-};
+	point_cloud_subscription_ =
+			this->create_subscription<sensor_msgs::msg::PointCloud2>(cloud_topic.c_str(), rclcpp::SensorDataQoS(), std::bind(&LaserscanVirtualizer::pointCloudCallback, this, _1));
+	cloud_frame = "";
+
+	istringstream iss(virtual_laser_scan);
+	pending_frames_ = std::set<std::string>(
+			istream_iterator<string>(iss), istream_iterator<string>());
+
+	discovery_timer_ = this->create_wall_timer(
+			std::chrono::seconds(1), std::bind(&LaserscanVirtualizer::discoveryTimerCallback, this));
+	discoveryTimerCallback();
+}
 
 rcl_interfaces::msg::SetParametersResult LaserscanVirtualizer::reconfigureCallback(const std::vector<rclcpp::Parameter> &parameters)
 {
@@ -106,28 +116,55 @@ rcl_interfaces::msg::SetParametersResult LaserscanVirtualizer::reconfigureCallba
 	return result;
 }
 
+void LaserscanVirtualizer::discoveryTimerCallback()
+{
+	if (pending_frames_.empty())
+	{
+		discovery_timer_->cancel();
+		return;
+	}
+
+	virtual_laser_scan_parser();
+
+	if (!pending_frames_.empty())
+	{
+		std::ostringstream missing;
+		std::copy(pending_frames_.begin(), pending_frames_.end(), std::ostream_iterator<std::string>(missing, " "));
+		RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000, "Waiting for TF of frames: %s", missing.str().c_str());
+	}
+	else
+	{
+		discovery_timer_->cancel();
+	}
+}
+
 void LaserscanVirtualizer::virtual_laser_scan_parser()
 {
-	// LaserScan frames to use for virtualization
-	istringstream iss(virtual_laser_scan);
-	std::vector<string> tokens;
-	copy(istream_iterator<string>(iss), istream_iterator<string>(), back_inserter<std::vector<string>>(tokens));
-
 	std::vector<string> tmp_output_frames;
 
-	for (std::vector<int>::size_type i = 0; i < tokens.size(); i++)
+	for (auto it = pending_frames_.begin(); it != pending_frames_.end();)
 	{
-		auto beg = this->get_clock()->now();
-		if (tf_buffer_->canTransform(base_frame, tokens[i], rclcpp::Time(0), rclcpp::Duration(1, 0))) // Check if TF knows the transform from this frame reference to base_frame reference
+		if (tf_buffer_->canTransform(base_frame, *it, rclcpp::Time(0), rclcpp::Duration(1, 0))) // Check if TF knows the transform from this frame reference to base_frame reference
 		{
-			cout << "Elapsed: " << (this->get_clock()->now() - beg).nanoseconds() / 1e9 << endl;
-			cout << "Adding: " << tokens[i] << endl;
-			tmp_output_frames.push_back(tokens[i]);
+			RCLCPP_INFO(this->get_logger(), "Adding virtual scan frame: %s", it->c_str());
+			tmp_output_frames.push_back(*it);
+			it = pending_frames_.erase(it);
 		}
 		else
 		{
-			cout << "Can't transform: '" << tokens[i] + "' to '" << base_frame << "'" << endl;
+			RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000, "Can't transform '%s' to '%s'", it->c_str(), base_frame.c_str());
+			++it;
 		}
+	}
+
+	if (tmp_output_frames.empty())
+	{
+		return;
+	}
+
+	for (const auto &frame : output_frames)
+	{
+		tmp_output_frames.push_back(frame);
 	}
 
 	// Sort and remove duplicates
@@ -145,63 +182,21 @@ void LaserscanVirtualizer::virtual_laser_scan_parser()
 		{
 			virtual_scan_publishers.resize(output_frames.size());
 			RCLCPP_INFO(this->get_logger(), "Publishing: %ld virtual scans", virtual_scan_publishers.size());
-			cout << "Advertising topics: " << endl;
 			for (std::vector<int>::size_type i = 0; i < output_frames.size(); ++i)
 			{
 				if (output_laser_topic.empty())
 				{
 					virtual_scan_publishers[i] = this->create_publisher<sensor_msgs::msg::LaserScan>(output_frames[i].c_str(), rclcpp::SensorDataQoS());
-					cout << "\t\t" << output_frames[i] << " on topic " << output_frames[i].c_str() << endl;
+					RCLCPP_INFO(this->get_logger(), "\t%s on topic %s", output_frames[i].c_str(), output_frames[i].c_str());
 				}
 				else
 				{
 					virtual_scan_publishers[i] = this->create_publisher<sensor_msgs::msg::LaserScan>(output_laser_topic.c_str(), rclcpp::SensorDataQoS());
-					cout << "\t\t" << output_frames[i] << " on topic " << output_laser_topic.c_str() << endl;
+					RCLCPP_INFO(this->get_logger(), "\t%s on topic %s", output_frames[i].c_str(), output_laser_topic.c_str());
 				}
 			}
 		}
-		else
-		{
-			RCLCPP_INFO(this->get_logger(), "Not publishing to any topic.");
-		}
 	}
-}
-
-LaserscanVirtualizer::LaserscanVirtualizer() : Node("laserscan_virtualizer")
-{
-	this->declare_parameter<std::string>("base_frame", "base_link");
-	this->declare_parameter<std::string>("cloud_topic", "/cloud_pcd");
-	this->declare_parameter<std::string>("output_laser_topic", "/scan");
-	this->declare_parameter<std::string>("virtual_laser_scan", "scansx scandx");
-	this->declare_parameter("angle_min", -3.14);
-	this->declare_parameter("angle_max", 3.14);
-	this->declare_parameter("angle_increment", 0.0058);
-	this->declare_parameter("scan_time", 0.0);
-	this->declare_parameter("range_min", 0.0);
-	this->declare_parameter("range_max", 25.0);
-
-	this->get_parameter("base_frame", base_frame);
-	this->get_parameter("cloud_topic", cloud_topic);
-	this->get_parameter("output_laser_topic", output_laser_topic);
-	this->get_parameter("virtual_laser_scan", virtual_laser_scan);
-	this->get_parameter("angle_min", angle_min);
-	this->get_parameter("angle_max", angle_max);
-	this->get_parameter("angle_increment", angle_increment);
-	this->get_parameter("scan_time", scan_time);
-	this->get_parameter("range_min", range_min);
-	this->get_parameter("range_max", range_max);
-
-	param_callback_handle_ = this->add_on_set_parameters_callback(
-			std::bind(&LaserscanVirtualizer::reconfigureCallback, this, _1));
-
-	tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-	tfListener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
-
-	this->virtual_laser_scan_parser();
-
-	point_cloud_subscription_ =
-			this->create_subscription<sensor_msgs::msg::PointCloud2>(cloud_topic.c_str(), rclcpp::SensorDataQoS(), std::bind(&LaserscanVirtualizer::pointCloudCallback, this, _1));
-	cloud_frame = "";
 }
 
 void LaserscanVirtualizer::pointCloudCallback(sensor_msgs::msg::PointCloud2::SharedPtr pcl_in)
@@ -250,63 +245,25 @@ void LaserscanVirtualizer::pointCloudCallback(sensor_msgs::msg::PointCloud2::Sha
 
 void LaserscanVirtualizer::pointcloud_to_laserscan(Eigen::MatrixXf points, pcl::PCLHeader scan_header, int pub_index) // pcl::PCLPointCloud2 *merged_cloud)
 {
-	sensor_msgs::msg::LaserScan output;
-	output.header = pcl_conversions::fromPCL(scan_header);
-	output.angle_min = this->angle_min;
-	output.angle_max = this->angle_max;
-	output.angle_increment = this->angle_increment;
-	output.time_increment = this->time_increment;
-	output.scan_time = this->scan_time;
-	output.range_min = this->range_min;
-	output.range_max = this->range_max;
+	auto output = std::make_unique<sensor_msgs::msg::LaserScan>();
+	output->header = pcl_conversions::fromPCL(scan_header);
+	output->angle_min = this->angle_min;
+	output->angle_max = this->angle_max;
+	output->angle_increment = this->angle_increment;
+	output->time_increment = this->time_increment;
+	output->scan_time = this->scan_time;
+	output->range_min = this->range_min;
+	output->range_max = this->range_max;
 
-	uint32_t ranges_size = std::ceil((output.angle_max - output.angle_min) / output.angle_increment);
-	output.ranges.assign(ranges_size, output.range_max + 1.0);
+	uint32_t ranges_size = std::ceil((output->angle_max - output->angle_min) / output->angle_increment);
+	output->ranges.assign(ranges_size, output->range_max + 1.0);
 
-	for (int i = 0; i < points.cols(); i++)
-	{
-		const float &x = points(0, i);
-		const float &y = points(1, i);
-		const float &z = points(2, i);
+	ira_laser_tools::projectPointsToScan(points, *output);
 
-		if (std::isnan(x) || std::isnan(y) || std::isnan(z))
-		{
-			RCLCPP_DEBUG(this->get_logger(), "rejected for nan in point(%f, %f, %f)\n", x, y, z);
-			continue;
-		}
-
-		double range_sq = pow(y, 2) + pow(x, 2);
-		double range_min_sq_ = output.range_min * output.range_min;
-		if (range_sq < range_min_sq_)
-		{
-			RCLCPP_DEBUG(this->get_logger(), "rejected for range %f below minimum value %f. Point: (%f, %f, %f)", range_sq, range_min_sq_, x, y, z);
-			continue;
-		}
-
-		double angle = atan2(y, x);
-		if (angle < output.angle_min || angle > output.angle_max)
-		{
-			RCLCPP_DEBUG(this->get_logger(), "rejected for angle %f not in range (%f, %f)\n", angle, output.angle_min, output.angle_max);
-			continue;
-		}
-
-		int index = (angle - output.angle_min) / output.angle_increment;
-		if (output.ranges[index] * output.ranges[index] > range_sq)
-		{
-			output.ranges[index] = sqrt(range_sq);
-		}
-	}
-
-	virtual_scan_publishers[pub_index]->publish(output);
+	virtual_scan_publishers[pub_index]->publish(std::move(output));
 }
 
-int main(int argc, char **argv)
-{
-	rclcpp::init(argc, argv);
+}  // namespace ira_laser_tools
 
-	rclcpp::spin(std::make_shared<LaserscanVirtualizer>());
-
-	rclcpp::shutdown();
-
-	return 0;
-}
+#include "rclcpp_components/register_node_macro.hpp"
+RCLCPP_COMPONENTS_REGISTER_NODE(ira_laser_tools::LaserscanVirtualizer)

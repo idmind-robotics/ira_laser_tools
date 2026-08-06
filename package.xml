@@ -23,6 +23,7 @@
   <depend>laser_geometry</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_action</depend>
+  <depend>rclcpp_components</depend>
   <depend>rclcpp_lifecycle</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>
